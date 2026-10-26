@@ -130,7 +130,9 @@ jobs:
           # Tag builds stay private until every platform succeeds and the
           # macOS app has passed strict signature/notarization verification.
           releaseDraft: ${{ github.event_name == 'push' }}
-          prerelease: false
+          # Beta/RC tags carry a hyphen (e.g. v0.6.13-beta); mark those as
+          # pre-releases so a test build never takes over "Latest".
+          prerelease: ${{ github.event_name == 'push' && contains(github.ref_name, '-') }}
           args: ${{ matrix.args }}
 
       - name: Verify signed macOS app and DMG
