@@ -82,7 +82,7 @@ const SEARCH_PROVIDERS = [
   {
     id: "doubao",
     label: "Doubao Search",
-    hint: "Volcengine Doubao web search (联网搜索)",
+    hint: "Volcengine Doubao web search (Custom / Global)",
     keyPlaceholder: "Enter your Volcengine search API key",
     configKind: "key",
     baseUrlPlaceholder: DEFAULT_DOUBAO_SEARCH_URL,

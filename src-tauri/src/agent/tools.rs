@@ -2007,6 +2007,76 @@ fn provider_base_url(config: &WebSearchConfig, provider: &str, default: &str) ->
         .to_string()
 }
 
+/// Which Volcengine Doubao Search product a Base URL points at. The two
+/// products share a host, request body, and error envelope but return
+/// completely different result shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoubaoVariant {
+    /// `/search_api/web_search` — `Result.WebResults[]`.
+    Custom,
+    /// `/search_api/global_search` — `Result.Documents[]`.
+    Global,
+}
+
+/// Endpoint suffixes users may paste into the Base URL field. Ordered longest
+/// first so `/v1/tools/search` wins over `/tools/search` and `/v1`.
+const DEEPSEEK_ENDPOINT_SUFFIXES: &[&str] = &["/v1/tools/search", "/tools/search", "/v1"];
+const DOUBAO_ENDPOINT_SUFFIXES: &[&str] = &[
+    "/search_api/global_search",
+    "/search_api/web_search",
+    "/global_search",
+    "/web_search",
+    "/search_api",
+];
+
+/// Split a Base URL into its path portion and any `?query` / `#fragment` tail,
+/// so a pasted query string is not mangled when the path is rewritten.
+fn split_url_tail(base: &str) -> (&str, &str) {
+    match base.find(|c: char| c == '?' || c == '#') {
+        Some(index) => (&base[..index], &base[index..]),
+        None => (base, ""),
+    }
+}
+
+/// Strip a known endpoint suffix so the caller can rebuild the canonical path.
+/// Without this a Base URL pasted straight from the docs (for example
+/// `https://api.deepseek.com/v1/tools/search`) would get the path appended a
+/// second time and answer with a confusing 404.
+fn strip_known_endpoint<'a, 'b>(
+    path: &'a str,
+    suffixes: &'b [&'b str],
+) -> (&'a str, Option<&'b str>) {
+    for suffix in suffixes {
+        if let Some(root) = path.strip_suffix(*suffix) {
+            return (root, Some(*suffix));
+        }
+    }
+    (path, None)
+}
+
+fn deepseek_endpoint(base: &str) -> String {
+    let (path, tail) = split_url_tail(base.trim());
+    let (root, _) = strip_known_endpoint(path.trim_end_matches('/'), DEEPSEEK_ENDPOINT_SUFFIXES);
+    let root = root.trim_end_matches('/');
+    format!("{root}/v1/tools/search{tail}")
+}
+
+fn doubao_endpoint(base: &str) -> (String, DoubaoVariant) {
+    let (path, tail) = split_url_tail(base.trim());
+    let (root, matched) =
+        strip_known_endpoint(path.trim_end_matches('/'), DOUBAO_ENDPOINT_SUFFIXES);
+    let variant = match matched {
+        Some(suffix) if suffix.contains("global_search") => DoubaoVariant::Global,
+        _ => DoubaoVariant::Custom,
+    };
+    let route = match variant {
+        DoubaoVariant::Global => "/search_api/global_search",
+        DoubaoVariant::Custom => "/search_api/web_search",
+    };
+    let root = root.trim_end_matches('/');
+    (format!("{root}{route}{tail}"), variant)
+}
+
 async fn deepseek_search(
     client: &reqwest::Client,
     query: &str,
@@ -2014,14 +2084,15 @@ async fn deepseek_search(
     max_results: usize,
 ) -> Result<Vec<WebSearchItem>, String> {
     let key = required_api_key(config, "DeepSeek Search")?;
-    // `provider_base_url` strips trailing slashes, so a custom gateway root and
-    // the bare `https://api.deepseek.com` host both resolve to the same path.
-    // A base that already carries the version segment is tolerated as well.
-    let base = provider_base_url(config, "deepseek", DEFAULT_DEEPSEEK_SEARCH_URL);
-    let base = base.strip_suffix("/v1").unwrap_or(&base);
-    let endpoint = format!("{base}/v1/tools/search");
+    // The Base URL field accepts a bare host, a gateway root, or the full
+    // endpoint copied from the docs; `deepseek_endpoint` normalizes all of them.
+    let endpoint = deepseek_endpoint(&provider_base_url(
+        config,
+        "deepseek",
+        DEFAULT_DEEPSEEK_SEARCH_URL,
+    ));
     let response = client
-        .post(endpoint)
+        .post(&endpoint)
         .header("Accept", "application/json")
         .bearer_auth(key)
         .json(&json!({
@@ -2033,8 +2104,13 @@ async fn deepseek_search(
         }))
         .send()
         .await
-        .map_err(|err| format!("Network error reaching DeepSeek Search: {err}"))?;
-    parse_web_json_response(response, "DeepSeek Search", parse_deepseek_results).await
+        .map_err(|err| {
+            format!("Network error reaching DeepSeek Search: {err} [endpoint: {endpoint}]")
+        })?;
+    with_endpoint(
+        parse_web_json_response(response, "DeepSeek Search", parse_deepseek_results).await,
+        &endpoint,
+    )
 }
 
 fn parse_deepseek_results(value: Value) -> Vec<WebSearchItem> {
@@ -2076,14 +2152,16 @@ async fn doubao_search(
     max_results: usize,
 ) -> Result<Vec<WebSearchItem>, String> {
     let key = required_api_key(config, "Doubao Search")?;
-    let base = provider_base_url(config, "doubao", DEFAULT_DOUBAO_SEARCH_URL);
-    let endpoint = if base.ends_with("/search_api") {
-        format!("{base}/web_search")
-    } else {
-        format!("{base}/search_api/web_search")
-    };
+    // Custom (`web_search`) and Global (`global_search`) share a host and
+    // request body but return different result shapes, so the Base URL decides
+    // both the route and the parser.
+    let (endpoint, variant) = doubao_endpoint(&provider_base_url(
+        config,
+        "doubao",
+        DEFAULT_DOUBAO_SEARCH_URL,
+    ));
     let response = client
-        .post(endpoint)
+        .post(&endpoint)
         .header("Accept", "application/json")
         .bearer_auth(key)
         .json(&json!({
@@ -2102,11 +2180,38 @@ async fn doubao_search(
         }))
         .send()
         .await
-        .map_err(|err| format!("Network error reaching Doubao Search: {err}"))?;
-    parse_web_json_response(response, "Doubao Search", parse_doubao_results).await
+        .map_err(|err| {
+            format!("Network error reaching Doubao Search: {err} [endpoint: {endpoint}]")
+        })?;
+    with_endpoint(
+        parse_web_json_response(response, "Doubao Search", |value| {
+            parse_doubao_results(value, variant)
+        })
+        .await,
+        &endpoint,
+    )
 }
 
-fn parse_doubao_results(value: Value) -> Vec<WebSearchItem> {
+/// Parse a Doubao response. The Custom and Global products answer with
+/// different shapes, so the variant picked from the Base URL decides the
+/// primary parser; the other shape is tried as a fallback in case a gateway
+/// proxies one route onto the other.
+fn parse_doubao_results(value: Value, variant: DoubaoVariant) -> Vec<WebSearchItem> {
+    let primary = match variant {
+        DoubaoVariant::Custom => parse_doubao_web_results(&value),
+        DoubaoVariant::Global => parse_doubao_documents(&value),
+    };
+    if !primary.is_empty() {
+        return primary;
+    }
+    match variant {
+        DoubaoVariant::Custom => parse_doubao_documents(&value),
+        DoubaoVariant::Global => parse_doubao_web_results(&value),
+    }
+}
+
+/// Custom 版：`Result.WebResults[]` with `Snippet` as a plain string.
+fn parse_doubao_web_results(value: &Value) -> Vec<WebSearchItem> {
     value
         .get("Result")
         .and_then(|result| result.get("WebResults"))
@@ -2114,29 +2219,68 @@ fn parse_doubao_results(value: Value) -> Vec<WebSearchItem> {
         .into_iter()
         .flatten()
         .map(|item| WebSearchItem {
-            title: item
-                .get("Title")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("Untitled")
-                .to_string(),
-            url: item
-                .get("Url")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            title: doubao_text(item.get("Title")).unwrap_or_else(|| "Untitled".to_string()),
+            url: doubao_text(item.get("Url")).unwrap_or_default(),
             // Volcengine documents `Snippet` as list-only display text and
             // `Summary` as the 500-1000 character digest meant for models.
-            snippet: item
-                .get("Summary")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| item.get("Snippet").and_then(Value::as_str))
-                .or_else(|| item.get("Content").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_string(),
+            snippet: doubao_text(item.get("Summary"))
+                .or_else(|| doubao_text(item.get("Snippet")))
+                .or_else(|| doubao_text(item.get("Content")))
+                .unwrap_or_default(),
         })
         .collect()
+}
+
+/// Global 版：`Result.Documents[]` with `Snippet` split into typed segments
+/// (`[{ "Type": "text", "Text": "..." }]`) and no `Summary` field.
+fn parse_doubao_documents(value: &Value) -> Vec<WebSearchItem> {
+    value
+        .get("Result")
+        .and_then(|result| result.get("Documents"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| WebSearchItem {
+            title: doubao_text(item.get("Title")).unwrap_or_else(|| "Untitled".to_string()),
+            url: doubao_text(item.get("Url")).unwrap_or_default(),
+            snippet: doubao_text(item.get("Summary"))
+                .or_else(|| doubao_snippet_text(item.get("Snippet")))
+                .or_else(|| doubao_text(item.get("Content")))
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn doubao_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Join the Global 版 snippet segments, ignoring non-text parts. Plain string
+/// snippets are accepted as well so a single parser tolerates both products.
+fn doubao_snippet_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(Value::Array(segments)) => {
+            let joined = segments
+                .iter()
+                .filter_map(|segment| segment.get("Text").and_then(Value::as_str))
+                .collect::<String>();
+            let trimmed = joined.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => None,
+    }
 }
 
 async fn serpapi_search(
@@ -2178,6 +2322,13 @@ async fn serpapi_search(
     .await
 }
 
+/// Append the endpoint that was actually requested to a provider error. Search
+/// failures are often caused by a malformed Base URL (a duplicated path answers
+/// with a misleading 401/404), so the URL belongs in the message.
+fn with_endpoint<T>(result: Result<T, String>, endpoint: &str) -> Result<T, String> {
+    result.map_err(|err| format!("{err} [endpoint: {endpoint}]"))
+}
+
 async fn parse_web_json_response(
     response: reqwest::Response,
     provider: &str,
@@ -2190,7 +2341,7 @@ async fn parse_web_json_response(
         .map_err(|err| format!("Failed to read {provider} response: {err}"))?;
     if !status.is_success() {
         return Err(format!(
-            "{provider} search failed ({status}): {}",
+            "{provider} failed ({status}): {}",
             trim_text(&text, 300)
         ));
     }
@@ -2201,7 +2352,7 @@ async fn parse_web_json_response(
         )
     })?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(format!("{provider} search failed: {error}"));
+        return Err(format!("{provider} failed: {error}"));
     }
     if let Some(message) = provider_payload_error(provider, &value) {
         return Err(message);
@@ -2273,10 +2424,26 @@ fn provider_payload_error(provider: &str, value: &Value) -> Option<String> {
                 format!("{provider} failed (code {code}): {message}")
             });
         }
+        // The Global product additionally reports soft failures on
+        // `Result.ErrorCode` (0 on success) with `Result.ErrorMsg`.
+        if let Some(code) = value
+            .get("Result")
+            .and_then(|result| result.get("ErrorCode"))
+            .and_then(Value::as_i64)
+            .filter(|code| *code != 0)
+        {
+            let message = value
+                .get("Result")
+                .and_then(|result| result.get("ErrorMsg"))
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("unknown API error");
+            return Some(format!("{provider} failed (code {code}): {message}"));
+        }
     }
     if provider == "Brave Search" && value.get("web").is_none() {
         let message = value.get("message").and_then(Value::as_str)?;
-        return Some(format!("{provider} search failed: {message}"));
+        return Some(format!("{provider} failed: {message}"));
     }
     None
 }
@@ -3914,7 +4081,7 @@ mod tests {
         let value = json!({ "message": "invalid subscription token" });
         assert_eq!(
             provider_payload_error("Brave Search", &value),
-            Some("Brave Search search failed: invalid subscription token".to_string())
+            Some("Brave Search failed: invalid subscription token".to_string())
         );
     }
 
@@ -4026,30 +4193,103 @@ mod tests {
 
     #[test]
     fn doubao_results_read_pascal_case_web_results() {
-        let items = parse_doubao_results(json!({
-            "ResponseMetadata": { "RequestId": "abc" },
-            "Result": {
-                "ResultCount": 2,
-                "WebResults": [
-                    {
-                        "Title": "北京游玩攻略",
-                        "Url": "https://example.com/beijing",
-                        "Snippet": "短片段",
-                        "Summary": "相关摘要"
-                    },
-                    {
-                        "Title": "Snippet only",
-                        "Url": "https://example.com/snippet",
-                        "Snippet": "fallback snippet"
-                    }
-                ]
-            }
-        }));
+        let items = parse_doubao_results(
+            json!({
+                "ResponseMetadata": { "RequestId": "abc" },
+                "Result": {
+                    "ResultCount": 2,
+                    "WebResults": [
+                        {
+                            "Title": "北京游玩攻略",
+                            "Url": "https://example.com/beijing",
+                            "Snippet": "短片段",
+                            "Summary": "相关摘要"
+                        },
+                        {
+                            "Title": "Snippet only",
+                            "Url": "https://example.com/snippet",
+                            "Snippet": "fallback snippet"
+                        }
+                    ]
+                }
+            }),
+            DoubaoVariant::Custom,
+        );
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "北京游玩攻略");
         assert_eq!(items[0].url, "https://example.com/beijing");
         assert_eq!(items[0].snippet, "相关摘要");
         assert_eq!(items[1].snippet, "fallback snippet");
+    }
+
+    #[test]
+    fn doubao_global_results_join_snippet_segments() {
+        let items = parse_doubao_results(
+            json!({
+                "ResponseMetadata": { "RequestId": "abc" },
+                "Result": {
+                    "TotalDocCount": 2,
+                    "ErrorCode": 0,
+                    "ErrorMsg": "",
+                    "Documents": [
+                        {
+                            "Rank": 0,
+                            "Url": "https://example.com/global",
+                            "Title": "吉米·威尔士",
+                            "Snippet": [
+                                { "Type": "text", "Text": "第一段" },
+                                { "Type": "text", "Text": "第二段" }
+                            ]
+                        },
+                        {
+                            "Rank": 1,
+                            "Url": "https://example.com/plain",
+                            "Title": "Plain snippet",
+                            "Snippet": "普通字符串片段"
+                        }
+                    ]
+                }
+            }),
+            DoubaoVariant::Global,
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "吉米·威尔士");
+        assert_eq!(items[0].url, "https://example.com/global");
+        assert_eq!(items[0].snippet, "第一段第二段");
+        assert_eq!(items[1].snippet, "普通字符串片段");
+    }
+
+    #[test]
+    fn doubao_global_results_skip_non_text_segments() {
+        let items = parse_doubao_results(
+            json!({
+                "Result": {
+                    "Documents": [{
+                        "Url": "https://example.com/mixed",
+                        "Title": "Mixed",
+                        "Snippet": [
+                            { "Type": "image", "Url": "https://example.com/a.png" },
+                            { "Type": "text", "Text": "只有这段是正文" }
+                        ]
+                    }]
+                }
+            }),
+            DoubaoVariant::Global,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].snippet, "只有这段是正文");
+    }
+
+    #[test]
+    fn doubao_variant_falls_back_to_other_shape() {
+        // A gateway may proxy one route onto the other product; parsing must
+        // still succeed instead of silently returning "no results".
+        let items = parse_doubao_results(
+            json!({ "Result": { "WebResults": [{ "Title": "T", "Url": "https://e.com" }] } }),
+            DoubaoVariant::Global,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "T");
     }
 
     #[test]
@@ -4110,6 +4350,93 @@ mod tests {
             provider_base_url(&custom, "deepseek", DEFAULT_DEEPSEEK_SEARCH_URL),
             "https://gateway.example.com/v1"
         );
+    }
+
+    #[test]
+    fn deepseek_endpoint_normalizes_all_base_forms() {
+        // A Base URL may be a bare host, a versioned root, or the full endpoint
+        // pasted from the docs. All of them must resolve to one URL.
+        for base in [
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/",
+            "https://api.deepseek.com/v1",
+            "https://api.deepseek.com/v1/",
+            "https://api.deepseek.com/v1/tools/search",
+            "https://api.deepseek.com/v1/tools/search/",
+            "https://api.deepseek.com/tools/search",
+            "  https://api.deepseek.com/v1  ",
+        ] {
+            assert_eq!(
+                deepseek_endpoint(base),
+                "https://api.deepseek.com/v1/tools/search",
+                "base: {base}"
+            );
+        }
+        // A gateway prefix is preserved instead of being treated as a version.
+        assert_eq!(
+            deepseek_endpoint("https://gw.example.com/deepseek"),
+            "https://gw.example.com/deepseek/v1/tools/search"
+        );
+    }
+
+    #[test]
+    fn deepseek_endpoint_keeps_query_string() {
+        assert_eq!(
+            deepseek_endpoint("https://gw.example.com/x?k=1"),
+            "https://gw.example.com/x/v1/tools/search?k=1"
+        );
+    }
+
+    #[test]
+    fn doubao_endpoint_detects_variant() {
+        for (base, expected_endpoint, expected_variant) in [
+            (
+                "https://open.feedcoopapi.com",
+                "https://open.feedcoopapi.com/search_api/web_search",
+                DoubaoVariant::Custom,
+            ),
+            (
+                "https://open.feedcoopapi.com/search_api",
+                "https://open.feedcoopapi.com/search_api/web_search",
+                DoubaoVariant::Custom,
+            ),
+            (
+                "https://open.feedcoopapi.com/search_api/web_search",
+                "https://open.feedcoopapi.com/search_api/web_search",
+                DoubaoVariant::Custom,
+            ),
+            (
+                "https://open.feedcoopapi.com/search_api/global_search",
+                "https://open.feedcoopapi.com/search_api/global_search",
+                DoubaoVariant::Global,
+            ),
+            (
+                "https://open.feedcoopapi.com/search_api/global_search/",
+                "https://open.feedcoopapi.com/search_api/global_search",
+                DoubaoVariant::Global,
+            ),
+        ] {
+            assert_eq!(
+                doubao_endpoint(base),
+                (expected_endpoint.to_string(), expected_variant),
+                "base: {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_endpoint_appends_endpoint_to_errors() {
+        let error = with_endpoint::<()>(
+            Err("Doubao Search failed (code x)".to_string()),
+            "https://e.com/s",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "Doubao Search failed (code x) [endpoint: https://e.com/s]"
+        );
+        let unchanged: Result<u8, String> = with_endpoint(Ok(7), "https://e.com/s");
+        assert_eq!(unchanged, Ok(7));
     }
 
     #[test]
