@@ -23,9 +23,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            rust_target: aarch64-apple-darwin
+          # macOS is intentionally skipped: the repository has no Apple
+          # Developer certificate configured, so `tauri build` compiles fine
+          # (51 min) and then fails at bundling with
+          # "failed to import keychain certificate". Restore this entry once
+          # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+          # / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID are set as secrets.
+          # - platform: macos-latest
+          #   args: '--target aarch64-apple-darwin'
+          #   rust_target: aarch64-apple-darwin
           - platform: ubuntu-22.04
             args: ''
             rust_target: ''
