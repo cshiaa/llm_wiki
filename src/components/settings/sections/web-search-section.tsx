@@ -16,6 +16,8 @@ import {
   SEARXNG_CATEGORY_OPTIONS,
   SERPAPI_ENGINE_OPTIONS,
   resolveSearchConfig,
+  DEFAULT_DEEPSEEK_SEARCH_URL,
+  DEFAULT_DOUBAO_SEARCH_URL,
   DEFAULT_FIRECRAWL_URL,
   webSearch,
 } from "@/lib/web-search"
@@ -68,6 +70,22 @@ const SEARCH_PROVIDERS = [
     hint: "Chinese and global web search via Bocha AI",
     keyPlaceholder: "Enter your Bocha API key (open.bocha.cn)",
     configKind: "key",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek Search",
+    hint: "DeepSeek native web search (api.deepseek.com /v1/tools/search)",
+    keyPlaceholder: "Enter your DeepSeek API key (platform.deepseek.com)",
+    configKind: "key",
+    baseUrlPlaceholder: DEFAULT_DEEPSEEK_SEARCH_URL,
+  },
+  {
+    id: "doubao",
+    label: "Doubao Search",
+    hint: "Volcengine Doubao web search (联网搜索)",
+    keyPlaceholder: "Enter your Volcengine search API key",
+    configKind: "key",
+    baseUrlPlaceholder: DEFAULT_DOUBAO_SEARCH_URL,
   },
 ] as const
 
@@ -417,6 +435,29 @@ export function WebSearchSection() {
                         <p className="text-xs text-muted-foreground">
                           {t("settings.sections.webSearch.bochaHint")}
                         </p>
+                      )}
+                      {provider.id === "deepseek" && (
+                        <p className="text-xs text-muted-foreground">
+                          {t("settings.sections.webSearch.deepseekHint")}
+                        </p>
+                      )}
+                      {provider.id === "doubao" && (
+                        <p className="text-xs text-muted-foreground">
+                          {t("settings.sections.webSearch.doubaoHint")}
+                        </p>
+                      )}
+                      {"baseUrlPlaceholder" in provider && (
+                        <div className="space-y-2 pt-2">
+                          <Label>{t("settings.sections.webSearch.optionalBaseUrl")}</Label>
+                          <Input
+                            value={override?.baseUrl ?? ""}
+                            onChange={(e) => updateProvider(provider.id, { baseUrl: e.target.value })}
+                            placeholder={provider.baseUrlPlaceholder}
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            {t("settings.sections.webSearch.optionalBaseUrlHint")}
+                          </p>
+                        </div>
                       )}
                     </div>
                   )}

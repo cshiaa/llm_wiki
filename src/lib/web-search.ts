@@ -16,6 +16,10 @@ export interface WebSearchResult {
 }
 
 export const DEFAULT_FIRECRAWL_URL = "https://api.firecrawl.dev"
+/** DeepSeek Search (`POST /v1/tools/search`); the version path is appended by Rust. */
+export const DEFAULT_DEEPSEEK_SEARCH_URL = "https://api.deepseek.com"
+/** Volcengine Doubao Search (`POST /search_api/web_search`). */
+export const DEFAULT_DOUBAO_SEARCH_URL = "https://open.feedcoopapi.com"
 
 export const SERPAPI_ENGINE_OPTIONS: { value: SerpApiEngine; label: string; hint: string }[] = [
   { value: "google", label: "Google Web", hint: "SerpApi Google Search API organic results" },
@@ -141,7 +145,9 @@ export async function webSearch(
       resolved.provider === "tavily" ||
       resolved.provider === "serpapi" ||
       resolved.provider === "brave" ||
-      resolved.provider === "bocha"
+      resolved.provider === "bocha" ||
+      resolved.provider === "deepseek" ||
+      resolved.provider === "doubao"
     ) &&
     !resolved.apiKey
   ) {

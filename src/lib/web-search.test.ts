@@ -66,6 +66,10 @@ describe("webSearch", () => {
       .rejects.toThrow("Add an API key for the selected search provider")
     await expect(webSearch("x", { provider: "bocha", apiKey: "" }, 5))
       .rejects.toThrow("Add an API key for the selected search provider")
+    await expect(webSearch("x", { provider: "deepseek", apiKey: "" }, 5))
+      .rejects.toThrow("Add an API key for the selected search provider")
+    await expect(webSearch("x", { provider: "doubao", apiKey: "" }, 5))
+      .rejects.toThrow("Add an API key for the selected search provider")
     await expect(webSearch("x", { provider: "searxng", apiKey: "" }, 5))
       .rejects.toThrow("Add a SearXNG instance URL")
     await expect(webSearch("x", { provider: "ollama", apiKey: "" }, 5))
@@ -97,6 +101,56 @@ describe("webSearch", () => {
   it("treats key-free providers as configured", () => {
     expect(hasConfiguredSearchProvider({ provider: "searxng", apiKey: "", searXngUrl: "http://localhost:8080" })).toBe(true)
     expect(hasConfiguredSearchProvider({ provider: "firecrawl", apiKey: "" })).toBe(true)
+  })
+
+  it("requires an API key for DeepSeek and Doubao providers", () => {
+    expect(hasConfiguredSearchProvider({ provider: "deepseek", apiKey: "" })).toBe(false)
+    expect(hasConfiguredSearchProvider({ provider: "doubao", apiKey: "" })).toBe(false)
+    expect(hasConfiguredSearchProvider({
+      provider: "deepseek",
+      apiKey: "",
+      providerConfigs: { deepseek: { apiKey: "sk-deepseek" } },
+    })).toBe(true)
+    expect(hasConfiguredSearchProvider({
+      provider: "doubao",
+      apiKey: "",
+      providerConfigs: { doubao: { apiKey: "volc-key" } },
+    })).toBe(true)
+  })
+
+  it("forwards DeepSeek and Doubao overrides including a custom base URL", async () => {
+    invokeMock.mockResolvedValue([])
+
+    await webSearch("q1", {
+      provider: "deepseek",
+      apiKey: "",
+      providerConfigs: { deepseek: { apiKey: "sk-deepseek", baseUrl: "https://gw.example.com" } },
+    }, 8)
+    expect(invokeMock).toHaveBeenLastCalledWith("web_search", {
+      query: "q1",
+      maxResults: 8,
+      config: expect.objectContaining({
+        provider: "deepseek",
+        apiKey: "sk-deepseek",
+        providerConfigs: expect.objectContaining({
+          deepseek: expect.objectContaining({ baseUrl: "https://gw.example.com" }),
+        }),
+      }),
+    })
+
+    await webSearch("q2", {
+      provider: "doubao",
+      apiKey: "",
+      providerConfigs: { doubao: { apiKey: "volc-key" } },
+    }, 8)
+    expect(invokeMock).toHaveBeenLastCalledWith("web_search", {
+      query: "q2",
+      maxResults: 8,
+      config: expect.objectContaining({
+        provider: "doubao",
+        apiKey: "volc-key",
+      }),
+    })
   })
 
   it("does not leak a stale top-level Ollama URL into non-Ollama providers", () => {

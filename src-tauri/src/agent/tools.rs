@@ -48,6 +48,11 @@ const SHELL_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
 const DEFAULT_ANYTXT_ENDPOINT: &str = "http://127.0.0.1:9920";
 const DEFAULT_ANYTXT_LIMIT: usize = 20;
 const ANYTXT_LAST_MODIFY_END: i64 = 2_147_483_647;
+/// DeepSeek Search (`POST /v1/tools/search`). The bare host is enough because
+/// the request builder appends the versioned path.
+const DEFAULT_DEEPSEEK_SEARCH_URL: &str = "https://api.deepseek.com";
+/// Volcengine Doubao Search (`POST /search_api/web_search`).
+const DEFAULT_DOUBAO_SEARCH_URL: &str = "https://open.feedcoopapi.com";
 static WIKI_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1309,6 +1314,8 @@ pub async fn run_web_search(
         "ollama" => ollama_search(&client, query, &config, max_results).await?,
         "brave" => brave_search(&client, query, &config, max_results).await?,
         "bocha" => bocha_search(&client, query, &config, max_results).await?,
+        "deepseek" => deepseek_search(&client, query, &config, max_results).await?,
+        "doubao" => doubao_search(&client, query, &config, max_results).await?,
         "serpapi" => serpapi_search(&client, query, &config, max_results).await?,
         other => {
             return Err(format!(
@@ -1320,9 +1327,13 @@ pub async fn run_web_search(
 }
 
 fn web_search_result_limit(provider: &str, requested: usize) -> usize {
-    // Bocha documents a 1-50 range. Existing providers retain the historical
-    // 20-result ceiling so adding Bocha cannot increase their request cost.
-    let provider_max = if provider == "bocha" { 50 } else { 20 };
+    // Bocha, DeepSeek, and Doubao all document a 1-50 range. Existing
+    // providers retain the historical 20-result ceiling so adding providers
+    // cannot increase their request cost.
+    let provider_max = match provider {
+        "bocha" | "deepseek" | "doubao" => 50,
+        _ => 20,
+    };
     requested.clamp(1, provider_max)
 }
 
@@ -1980,6 +1991,154 @@ fn parse_bocha_results(value: Value) -> Vec<WebSearchItem> {
         .collect()
 }
 
+/// Resolve a provider base URL from `providerConfigs.<provider>.baseUrl`,
+/// falling back to the provider's public endpoint. Trailing slashes are
+/// trimmed so callers can append their own path segments.
+fn provider_base_url(config: &WebSearchConfig, provider: &str, default: &str) -> String {
+    config
+        .provider_configs
+        .as_ref()
+        .and_then(|values| values.get(provider))
+        .and_then(|value| value.base_url.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default)
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+async fn deepseek_search(
+    client: &reqwest::Client,
+    query: &str,
+    config: &WebSearchConfig,
+    max_results: usize,
+) -> Result<Vec<WebSearchItem>, String> {
+    let key = required_api_key(config, "DeepSeek Search")?;
+    // `provider_base_url` strips trailing slashes, so a custom gateway root and
+    // the bare `https://api.deepseek.com` host both resolve to the same path.
+    // A base that already carries the version segment is tolerated as well.
+    let base = provider_base_url(config, "deepseek", DEFAULT_DEEPSEEK_SEARCH_URL);
+    let base = base.strip_suffix("/v1").unwrap_or(&base);
+    let endpoint = format!("{base}/v1/tools/search");
+    let response = client
+        .post(endpoint)
+        .header("Accept", "application/json")
+        .bearer_auth(key)
+        .json(&json!({
+            "query": query,
+            "count": max_results.clamp(1, 50),
+            // `summary` already carries the 600-800 character LLM-oriented
+            // digest; pulling full page bodies would only inflate prompts.
+            "need_content": false
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("Network error reaching DeepSeek Search: {err}"))?;
+    parse_web_json_response(response, "DeepSeek Search", parse_deepseek_results).await
+}
+
+fn parse_deepseek_results(value: Value) -> Vec<WebSearchItem> {
+    value
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| WebSearchItem {
+            title: item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Untitled")
+                .to_string(),
+            url: item
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            // Prefer the long summary over the ~150 character snippet, matching
+            // the Bocha provider: the snippet is also what Deep Research feeds
+            // to the model when the page itself cannot be fetched.
+            snippet: item
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| item.get("snippet").and_then(Value::as_str))
+                .or_else(|| item.get("content").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
+async fn doubao_search(
+    client: &reqwest::Client,
+    query: &str,
+    config: &WebSearchConfig,
+    max_results: usize,
+) -> Result<Vec<WebSearchItem>, String> {
+    let key = required_api_key(config, "Doubao Search")?;
+    let base = provider_base_url(config, "doubao", DEFAULT_DOUBAO_SEARCH_URL);
+    let endpoint = if base.ends_with("/search_api") {
+        format!("{base}/web_search")
+    } else {
+        format!("{base}/search_api/web_search")
+    };
+    let response = client
+        .post(endpoint)
+        .header("Accept", "application/json")
+        .bearer_auth(key)
+        .json(&json!({
+            // The Volcengine wire format is PascalCase, unlike the other
+            // providers in this module.
+            "Query": query,
+            "SearchType": "web",
+            "Count": max_results.clamp(1, 50),
+            "Filter": {
+                "NeedContent": false,
+                // Drop "火山如意" cards that carry no landing page; they would
+                // be discarded later anyway because references require a URL.
+                "NeedUrl": true
+            },
+            "QueryControl": { "QueryRewrite": false }
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("Network error reaching Doubao Search: {err}"))?;
+    parse_web_json_response(response, "Doubao Search", parse_doubao_results).await
+}
+
+fn parse_doubao_results(value: Value) -> Vec<WebSearchItem> {
+    value
+        .get("Result")
+        .and_then(|result| result.get("WebResults"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| WebSearchItem {
+            title: item
+                .get("Title")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Untitled")
+                .to_string(),
+            url: item
+                .get("Url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            // Volcengine documents `Snippet` as list-only display text and
+            // `Summary` as the 500-1000 character digest meant for models.
+            snippet: item
+                .get("Summary")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| item.get("Snippet").and_then(Value::as_str))
+                .or_else(|| item.get("Content").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
 async fn serpapi_search(
     client: &reqwest::Client,
     query: &str,
@@ -2063,6 +2222,56 @@ fn provider_payload_error(provider: &str, value: &Value) -> Option<String> {
                 "{provider} failed (code {}): {message}",
                 code.unwrap_or(0)
             ));
+        }
+    }
+    if provider == "DeepSeek Search" {
+        // DeepSeek uses the OpenAI-compatible error envelope, where `error` is
+        // an object rather than a string (the generic check above misses it).
+        if let Some(error) = value.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("unknown API error");
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .filter(|code| !code.trim().is_empty());
+            return Some(match code {
+                Some(code) => format!("{provider} failed ({code}): {message}"),
+                None => format!("{provider} failed: {message}"),
+            });
+        }
+    }
+    if provider == "Doubao Search" {
+        // Volcengine reports failures inside `ResponseMetadata.Error` while
+        // still answering with HTTP 200 and `Result: null`.
+        if let Some(error) = value
+            .get("ResponseMetadata")
+            .and_then(|metadata| metadata.get("Error"))
+        {
+            let code = error
+                .get("Code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    error
+                        .get("CodeN")
+                        .and_then(Value::as_i64)
+                        .map(|code| code.to_string())
+                })
+                .unwrap_or_default();
+            let message = error
+                .get("Message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("unknown API error");
+            return Some(if code.is_empty() {
+                format!("{provider} failed: {message}")
+            } else {
+                format!("{provider} failed (code {code}): {message}")
+            });
         }
     }
     if provider == "Brave Search" && value.get("web").is_none() {
@@ -3756,6 +3965,151 @@ mod tests {
         assert_eq!(web_search_result_limit("bocha", 100), 50);
         assert_eq!(web_search_result_limit("tavily", 100), 20);
         assert_eq!(web_search_result_limit("bocha", 0), 1);
+    }
+
+    #[test]
+    fn deepseek_and_doubao_accept_fifty_results() {
+        assert_eq!(web_search_result_limit("deepseek", 100), 50);
+        assert_eq!(web_search_result_limit("doubao", 100), 50);
+        assert_eq!(web_search_result_limit("deepseek", 0), 1);
+        assert_eq!(web_search_result_limit("doubao", 0), 1);
+    }
+
+    #[test]
+    fn deepseek_results_prefer_summary_over_snippet() {
+        let items = parse_deepseek_results(json!({
+            "results": [
+                {
+                    "title": "DeepSeek V4 模型发布",
+                    "url": "https://example.com/deepseek-v4",
+                    "snippet": "短摘要",
+                    "summary": "长摘要",
+                    "content": ""
+                },
+                {
+                    "title": "Snippet only",
+                    "url": "https://example.com/snippet",
+                    "snippet": "fallback snippet",
+                    "summary": ""
+                }
+            ]
+        }));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "DeepSeek V4 模型发布");
+        assert_eq!(items[0].url, "https://example.com/deepseek-v4");
+        assert_eq!(items[0].snippet, "长摘要");
+        assert_eq!(items[1].snippet, "fallback snippet");
+    }
+
+    #[test]
+    fn deepseek_openai_style_error_object_is_surfaced() {
+        let failure = json!({
+            "error": {
+                "message": "'count' must be between 1 and 50",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request_error"
+            }
+        });
+        assert_eq!(
+            provider_payload_error("DeepSeek Search", &failure),
+            Some(
+                "DeepSeek Search failed (invalid_request_error): 'count' must be between 1 and 50"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            provider_payload_error("DeepSeek Search", &json!({ "results": [] })),
+            None
+        );
+    }
+
+    #[test]
+    fn doubao_results_read_pascal_case_web_results() {
+        let items = parse_doubao_results(json!({
+            "ResponseMetadata": { "RequestId": "abc" },
+            "Result": {
+                "ResultCount": 2,
+                "WebResults": [
+                    {
+                        "Title": "北京游玩攻略",
+                        "Url": "https://example.com/beijing",
+                        "Snippet": "短片段",
+                        "Summary": "相关摘要"
+                    },
+                    {
+                        "Title": "Snippet only",
+                        "Url": "https://example.com/snippet",
+                        "Snippet": "fallback snippet"
+                    }
+                ]
+            }
+        }));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "北京游玩攻略");
+        assert_eq!(items[0].url, "https://example.com/beijing");
+        assert_eq!(items[0].snippet, "相关摘要");
+        assert_eq!(items[1].snippet, "fallback snippet");
+    }
+
+    #[test]
+    fn doubao_response_metadata_error_is_surfaced() {
+        let failure = json!({
+            "ResponseMetadata": {
+                "RequestId": "abc",
+                "Error": {
+                    "CodeN": 10406,
+                    "Code": "10406",
+                    "Message": "free search quota exhausted"
+                }
+            },
+            "Result": null
+        });
+        assert_eq!(
+            provider_payload_error("Doubao Search", &failure),
+            Some("Doubao Search failed (code 10406): free search quota exhausted".to_string())
+        );
+        assert_eq!(
+            provider_payload_error(
+                "Doubao Search",
+                &json!({ "ResponseMetadata": {}, "Result": { "WebResults": [] } })
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn deepseek_and_doubao_base_urls_fall_back_and_respect_overrides() {
+        let defaults = WebSearchConfig {
+            provider: "deepseek".to_string(),
+            ..WebSearchConfig::default()
+        };
+        assert_eq!(
+            provider_base_url(&defaults, "deepseek", DEFAULT_DEEPSEEK_SEARCH_URL),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            provider_base_url(&defaults, "doubao", DEFAULT_DOUBAO_SEARCH_URL),
+            "https://open.feedcoopapi.com"
+        );
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "deepseek".to_string(),
+            WebSearchProviderOverride {
+                base_url: Some("https://gateway.example.com/v1/".to_string()),
+                ..WebSearchProviderOverride::default()
+            },
+        );
+        let custom = WebSearchConfig {
+            provider: "deepseek".to_string(),
+            provider_configs: Some(overrides),
+            ..WebSearchConfig::default()
+        };
+        assert_eq!(
+            provider_base_url(&custom, "deepseek", DEFAULT_DEEPSEEK_SEARCH_URL),
+            "https://gateway.example.com/v1"
+        );
     }
 
     #[test]
